@@ -3,3 +3,5 @@
 /checkpoints
 /config.json
 /data
+/segment-anything-2
+/.env
