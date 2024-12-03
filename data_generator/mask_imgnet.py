@@ -67,6 +67,8 @@ def main():
     make_dir(inpaint_dir)
     foreground_dir = os.path.join(output_dir, "foreground")
     make_dir(foreground_dir)
+    mask_dir = os.path.join(output_dir, "mask")
+    make_dir(mask_dir)
 
     # Load bounding boxes
     with open(os.path.join(output_dir, 'all_bboxes.json'), 'r') as f:
@@ -101,9 +103,12 @@ def main():
             for k, mask in enumerate(masks):
                 foreground_name = f"{file_name}_mask_{k}_foreground.png"
                 background_name = f"{file_name}_mask_{k}_background.png"
+                mask_name = f"{file_name}_mask_{k}_mask.png"
                 
                 # Ensure mask is boolean
                 mask = torch.from_numpy(mask).bool()
+                if len(mask.shape) == 3:
+                    mask = mask.squeeze(0)
                 
                 # Read the original image
                 original_img = Image.open(image_paths[j]).convert("RGB")
@@ -120,10 +125,13 @@ def main():
                 # Convert tensors back to PIL images
                 foreground_img = Image.fromarray(foreground_tensor.permute(1, 2, 0).byte().numpy())
                 background_img = Image.fromarray(background_tensor.permute(1, 2, 0).byte().numpy())
+                # Convert boolean mask to PIL image (0 for background, 255 for foreground)
+                mask_img = Image.fromarray(mask.int().byte().numpy() * 255)
                 
                 # Save as images
                 foreground_img.save(os.path.join(foreground_dir, foreground_name))
                 background_img.save(os.path.join(inpaint_dir, background_name))
+                mask_img.save(os.path.join(mask_dir, mask_name))
                 shutil.copy(image_paths[j], os.path.join(model_dir, file))
 
 if __name__ == "__main__":
