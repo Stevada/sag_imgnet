@@ -59,8 +59,8 @@ def process_batch(predictor, image_batch, bboxes_batch):
     return all_masks
 
 def main():
-    data_dir = "/workspace/imagenet_val"
-    output_dir = "/home/stevexu/data/processed_imagenet/val"
+    data_dir = "/home/stevexu/data/generated_cup/trained-output/images"
+    output_dir = "/home/stevexu/data/generated_cup/trained-output/val"
     model_dir = os.path.join(output_dir, "model")
     make_dir(model_dir)
     inpaint_dir = os.path.join(output_dir, "inpaint")
@@ -75,7 +75,7 @@ def main():
     # Get all image files
     image_files = [f for f in os.listdir(data_dir) if f.endswith(('.JPEG', '.jpg', '.png'))]
     
-    batch_size = 4  # Adjust based on your GPU memory
+    batch_size = 16  # Adjust based on your GPU memory
     batch_num_limit = None
     
     for i in tqdm(range(0, len(image_files), batch_size)):
@@ -92,7 +92,7 @@ def main():
         print(f"Batch files: {batch_files}")
         
         image_batch = list(load_image_batch(image_paths, batch_size))[0]
-        bboxes_batch = [np.array([list(map(float, box.split(','))) for box in all_bboxes[f]]) for f in batch_files]
+        bboxes_batch = [np.array([list(map(float, box['bbox'].split(','))) for box in all_bboxes[f]]) for f in batch_files]
         
         masks_batch = process_batch(predictor, image_batch, bboxes_batch)
         

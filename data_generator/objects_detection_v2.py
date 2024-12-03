@@ -3,78 +3,112 @@ import os
 from PIL import Image, ImageDraw
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoProcessor, AutoModelForCausalLM
+import torchvision.transforms as transforms
+from transformers import DetrImageProcessor, DetrForObjectDetection
 from tqdm import tqdm
+from torchvision import transforms, models
+import torch.nn.functional as F
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
-torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-model = AutoModelForCausalLM.from_pretrained("microsoft/Florence-2-large", torch_dtype=torch_dtype, trust_remote_code=True).to(device)
-processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True)
-prompt = "<OD>"
-
+processor = DetrImageProcessor.from_pretrained('facebook/detr-resnet-50')
+model = DetrForObjectDetection.from_pretrained('facebook/detr-resnet-50').to(device)
+model.eval()
+classifier = models.resnet50(pretrained=True).to(device)
+classifier.eval()
+classifier_transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 class ImageNetDataset(Dataset):
-    def __init__(self, image_folder, processor, prompt):
+    def __init__(self, image_folder, prompt_folder, processor):
         self.image_folder = image_folder
         self.image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         self.processor = processor
-        self.prompt = prompt
-
-    def __len__(self):
-        return len(self.image_files)
-
+        
     def __getitem__(self, idx):
         image_name = self.image_files[idx]
         image_path = os.path.join(self.image_folder, image_name)
         image = Image.open(image_path).convert('RGB')
-        inputs = self.processor(text=self.prompt, images=image, return_tensors="pt")
+        
+        inputs = self.processor(images=image, return_tensors="pt")
         return {
             'image_name': image_name,
-            'image_size': torch.tensor([image.width, image.height]),
-            'input_ids': inputs['input_ids'].squeeze(),
-            'pixel_values': inputs['pixel_values'].squeeze()
+            'image_path': image_path,
+            'pixel_values': inputs['pixel_values'].squeeze(),
         }
+    
+    def __len__(self):
+        return len(self.image_files)
 
-def process_batch(batch, model, processor, all_bbox_dict):
-    input_ids = batch['input_ids'].to(device)
-    pixel_values = batch['pixel_values'].to(device, torch_dtype)
-
-    generated_ids = model.generate(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        max_new_tokens=1024,
-        num_beams=3,
-        do_sample=False
-    )
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)
-
-    for i, text in enumerate(generated_text):
-        image_name = batch['image_name'][i]
-        image_size = batch['image_size'][i]
-        result = processor.post_process_generation(text, task="<OD>", image_size=(image_size[0], image_size[1]))
-
-        # Calculate the area of the image
-        image_area = image_size[0] * image_size[1]
+def get_bbox_confidence(image, bbox, classifier, transform):
+    # Extract bbox coordinates and convert to integers
+    x1, y1, x2, y2 = map(int, bbox)
+    
+    # Crop the bbox region from the image
+    bbox_image = image.crop((x1, y1, x2, y2))
+    
+    # Preprocess the cropped image for the classifier
+    bbox_tensor = transform(bbox_image).unsqueeze(0).to(device)
+    
+    # Get classifier prediction
+    with torch.no_grad():
+        output = classifier(bbox_tensor)
+        confidence = F.softmax(output, dim=1)
         
-        # Filter bboxes that are larger than 10% of the image area
+    # Get confidence score for cup class (assume class_idx is 968 for cup)
+    # You might need to adjust this index based on your classifier's classes
+    cup_confidence = confidence[0][968].item()  # 968 is the ImageNet index for 'cup'
+    return cup_confidence
+
+def process_batch(batch, model, processor, classifier, all_bbox_dict):
+    pixel_values = batch['pixel_values'].to(device)
+    
+    # Get the original PIL images for cropping
+    original_images = [Image.open(img_path).convert('RGB') 
+                      for img_path in batch['image_path']]
+
+    with torch.no_grad():
+        outputs = model(pixel_values)
+
+    # Process DETR outputs
+    for i, image in enumerate(original_images):
+        probas = outputs.logits.softmax(-1)[0, :, :-1]
+        keep = probas.max(-1).values > 0.9  # Confidence threshold
+        
+        bboxes = outputs.pred_boxes[0, keep].cpu()
         filtered_bbox_list = []
-        for bbox in result[prompt]["bboxes"]:
-            x1, y1, x2, y2 = bbox
-            bbox_area = (x2 - x1) * (y2 - y1)
-            if bbox_area > 0.1 * image_area:
-                filtered_bbox_list.append(','.join(map(str, bbox)))
+        
+        # Convert relative coordinates to absolute
+        h, w = image.size
+        for bbox in bboxes:
+            x_c, y_c, width, height = bbox.tolist()
+            x1 = int((x_c - width/2) * w)
+            y1 = int((y_c - height/2) * h)
+            x2 = int((x_c + width/2) * w)
+            y2 = int((y_c + height/2) * h)
+            
+            # Get classifier confidence
+            confidence = get_bbox_confidence(image, (x1, y1, x2, y2), classifier, classifier_transform)
+            
+            # Only keep bbox if confidence exceeds threshold
+            if confidence > 0.5:  # Adjust threshold as needed
+                filtered_bbox_list.append(','.join(map(str, [x1, y1, x2, y2])))
         
         # Only add to all_bbox_dict if there are valid bboxes
         if filtered_bbox_list:
-            all_bbox_dict[image_name] = filtered_bbox_list
+            all_bbox_dict[batch['image_name'][i]] = filtered_bbox_list
 
 def main():
-    image_folder = "/workspace/imagenet_val"
-    output_folder = "/home/stevexu/data/processed_imagenet/val"
+    image_folder = "/home/stevexu/data/generated_cup/trained-output/split_right_images"
+    prompt_folder = "/home/stevexu/data/generated_cup/trained-output/prompts"
+    output_folder = "/home/stevexu/data/generated_cup/trained-output/val"
     os.makedirs(output_folder, exist_ok=True)
-    batch_size = 4 
-    batch_num_limit = 5
+    batch_size = 8
+    batch_num_limit = None
 
-    dataset = ImageNetDataset(image_folder, processor, prompt)
+    dataset = ImageNetDataset(image_folder, prompt_folder, processor)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     all_bbox_dict = {}
@@ -82,7 +116,7 @@ def main():
     for i, batch in enumerate(tqdm(dataloader, desc="Processing images")):
         if batch_num_limit and i >= batch_num_limit:
             break
-        process_batch(batch, model, processor, all_bbox_dict)
+        process_batch(batch, model, processor, classifier, all_bbox_dict)
 
     # Save all bounding box data to a JSON file
     json_filename = "all_bboxes.json"
